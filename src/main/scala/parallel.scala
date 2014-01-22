@@ -7,26 +7,60 @@ import ExecutionContext.Implicits.global
 import scala.collection.immutable.VectorBuilder
 import scala.collection.immutable.Vector
 import Ordering.Implicits._
-import Numeric.Implicits._
+// import Numeric.Implicits._  // Not clear what this one does
 import scala.math.Fractional.Implicits._
+//import scala.math.Integral.Implicits._
+//import scala.math.Numeric.Implicits._
+
+object DemoCode {
+  import scala.concurrent._
+  import scala.concurrent.duration._
+  import ExecutionContext.Implicits.global
+
+  val r = new java.util.Random()
+  val latch = new java.util.concurrent.CountDownLatch(1)
+  val f = future {latch.await; r.nextDouble}
+  val g1 = f.map {x:Double => s"My favorite number is $x. "}
+  val g2 = f.map {x:Double => s"I prefer ${2*x}. "}
+  val h = for (v1<-g1; v2<-g2) yield println(v1+v2)
+
+  /***
+        latch
+          |
+          f       wait on the latch, then emit random double
+        /   \
+      g1    g2    embed the double in a string
+        \   /
+          h       combine the strings
+          |
+   ***/
+
+  latch.countDown
+
+  val mondo = for (i <- 1 to 10000) yield future {Thread.sleep(1000); if (i%1000==0) println(s"hello from ${Thread.currentThread.getId}")}
 
 
-case class RollAvg[T](val m: Int, val l: Seq[T], val a: Seq[T], val r: Seq[T]) extends Logging {
+
+}
+
+case class RollAvg[T:Fractional](val m: Int, val l: Seq[T], val a: Seq[T], val r: Seq[T]) extends Logging {
   // fringes contain up to 2*m elements
   // averaging is over 2*m+1
   def this(m:Int, v:T) = this(m,Vector[T](v),Vector(),Vector[T](v))
 
+//(implicit numeric: Numeric[T], fractional: Fractional[T]) = { 
   // Knit together the fringe of two RollAvg objects
-  def knit(r: RollAvg[T])(implicit numeric: Numeric[T], fractional: Fractional[T]) = { 
+  def knit(r: RollAvg[T])  = {
+    val numeric = implicitly[Numeric[T]]
     val l : RollAvg[T] = this
     val m = l.m
     val divisor : T = numeric.fromInt(2*m+1)
     val z : T = numeric.fromInt(0)
     val weave = l.r ++ r.l
     if(weave.size>=(2*m+1)) {
-      val cs = weave.scanLeft(z)(numeric.plus(_,_))
+      val cs = weave.scanLeft(z)(_+_)
       val ca = cs.drop(2*m+1).zip(cs.dropRight(2*m+1)).
-                  map {p:(T,T)=>(numeric.minus(p._1,p._2)/divisor)}
+                  map {p:(T,T)=>(p._1-p._2)/divisor}
       val ret = 
         new RollAvg(m,
                     l.l ++ r.l.take(2*m - l.l.size),
@@ -86,7 +120,8 @@ object Parallel extends App with Logging {
   }
 
 
-  def rollingAverage[T](s: Seq[T], m:Int)(implicit numeric : Numeric[T], fractional : Fractional[T]) = 
+//(implicit numeric : Numeric[T], fractional : Fractional[T]) = 
+  def rollingAverage[T:Fractional](s: Seq[T], m:Int) =
     parAssocReduce(1 second)(s,
                             (l:Seq[T]) => new RollAvg[T](m,l(0)),
                             (l:RollAvg[T],r:RollAvg[T]) => l.knit(r),
@@ -112,6 +147,7 @@ object Parallel extends App with Logging {
       }
     }
   }
+
   def msortOld[T](l: Seq[T])(implicit o: Ordering[T]) : Seq[T] = {
     if(l.size<2) l
     else {
