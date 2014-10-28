@@ -1,6 +1,6 @@
 package com.podsnap.playground.parallel
 
-import com.typesafe.scalalogging.slf4j.Logging
+import com.typesafe.scalalogging.Logger
 import scala.concurrent._
 import scala.concurrent.duration._
 import ExecutionContext.Implicits.global
@@ -11,6 +11,7 @@ import Ordering.Implicits._
 import scala.math.Fractional.Implicits._
 //import scala.math.Integral.Implicits._
 //import scala.math.Numeric.Implicits._
+
 
 object DemoCode {
   import scala.concurrent._
@@ -43,7 +44,7 @@ object DemoCode {
 
 }
 
-case class RollAvg[T:Fractional](val m: Int, val l: Seq[T], val a: Seq[T], val r: Seq[T]) extends Logging {
+case class RollAvg[T:Fractional](val m: Int, val l: Seq[T], val a: Seq[T], val r: Seq[T]) {
   // fringes contain up to 2*m elements
   // averaging is over 2*m+1
   def this(m:Int, v:T) = this(m,Vector[T](v),Vector(),Vector[T](v))
@@ -66,7 +67,7 @@ case class RollAvg[T:Fractional](val m: Int, val l: Seq[T], val a: Seq[T], val r
                     l.l ++ r.l.take(2*m - l.l.size),
                     l.a ++ ca ++ r.a,
                     l.r.takeRight(2*m - r.r.size) ++ r.r)
-      logger.debug(s"$l + $r => $ret in thread ${Thread.currentThread.getId}")
+      //logger.debug(s"$l + $r => $ret in thread ${Thread.currentThread.getId}")
       ret
     }
     else {
@@ -82,7 +83,7 @@ case class RollAvg[T:Fractional](val m: Int, val l: Seq[T], val a: Seq[T], val r
 
 // Think: any way to make intermediate results available?
 
-object Parallel extends App with Logging {
+object Parallel extends App {
 
   //println(RollAvg.roll((1 to 20).map(_.toDouble).toSeq,1))
   println(rollingAverage((1 to 50).map(_.toDouble).map(x=>x*x).toSeq,2))
