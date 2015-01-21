@@ -11,3 +11,9 @@ def fb3(n : Int, p : String, c3 : Int, c5 : Int) : Stream[String] = {
 def fb3() : Stream[String] = fb3(1,"",2,4).tail
 
 }
+
+
+
+
+
+
