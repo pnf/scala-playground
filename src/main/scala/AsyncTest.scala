@@ -44,7 +44,7 @@ object Timeout {
       (pf:(Promise[Any],T=>Unit)) => 
         if(!pf._1.isCompleted) {pf._2(x)}}
   }}
-}
+ }
  
 object CancellablePromise {
   def apply[T] = new CancellablePromise[T](Promise[T]())
@@ -105,12 +105,22 @@ class NormalBuffer[T](n : Int, dropping : Boolean, sliding : Boolean) extends Ch
 	}
 }
 
-class Chan[T](b : ChanBuffer[T]) {
+class Chan[T](val b : ChanBuffer[T], val name : String) {
 
 	var pReadyForWrite = CancellablePromise[Unit].success(Unit)
 	var pReadyForRead = CancellablePromise[Unit]
 
-type CTuple = (Chan[T],T)
+def cast(t:Any) : T = t.asInstanceOf[T]
+  
+
+ def act[U](body: T=>U) : PartialFunction[CV[Any],U]= {case cv : CV[Any] if this==cv.c => body(cv.v.asInstanceOf[T])}
+  
+  def unapply(cv:CV[Any]) : Option[T] =
+    if(cv.c==this) {
+      println("Unapplying ", name)
+     Some(cv.v.asInstanceOf[T])
+    }
+    else None  
 
 private[this] def tryWrite(v : T, pNotify : Promise[Unit]) : Unit =
 this.synchronized {
@@ -127,7 +137,7 @@ this.synchronized {
 }
 
   
-private[this] def tryRead(pNotify : Promise[CTuple]) : Unit = 
+private[this] def tryRead(pNotify : Promise[CV[T]]) : Unit = 
 this.synchronized {
 	pNotify.synchronized {
     if(!pNotify.isCompleted) {
@@ -135,7 +145,7 @@ this.synchronized {
 					()=>{pReadyForRead=CancellablePromise[Unit]}) match {
 					case Some(v) => {
 						pReadyForRead = CancellablePromise[Unit]
-								pNotify.trySuccess((this,v))}
+								pNotify.trySuccess(CV(this,v))}
 					case None    => pReadyForRead.future.onSuccess {case _ => tryRead(pNotify)}
 			}
 		} 
@@ -152,35 +162,51 @@ def write(v: T, p: Promise[Unit]) : Unit = pReadyForWrite.future.onSuccess {case
 
 
 def read: Future[T] = {
-		val p = Promise[CTuple]
+		val p = Promise[CV[T]]
 				pReadyForRead.future.onSuccess {case _ => tryRead(p)}
-		p.future.map(_._2)
+		p.future.map(_.v)
 }
 
 
 
-def read(p: Promise[CTuple]) : Unit = {
+def read(p: Promise[CV[T]]) : Unit = {
   pReadyForRead.future(p.asInstanceOf[Promise[Any]]) {case _ => tryRead(p)}
 }  
     
 
 }
 
+case class CV[T](val c: Chan[T], val v:T)
+
+//object CV {
+//  def apply[T](c : Chan[T], v:T) = new CV(c,v)
+//  def unapply[T](cv:CV[Any]) : Option[(Chan[T],T)]= Some((cv.c,cv.v))
+//}
 
 
-
+import java.util.UUID
 object Chan {
-	def apply[T] = new Chan[T](new NormalBuffer(1,false,false))
-			def apply[T](n:Int) = new Chan[T](new NormalBuffer(n,false,false))
-			def timeout[T](d : Duration, v : T) : Chan[T] = {
-		val c = Chan[T]
-				Timeout.timeout(d) flatMap {_ => c.write(v)}
+  def apply[T](name:String) =new Chan[T](new NormalBuffer(1,false,false),name) 
+	def apply[T] = new Chan[T](new NormalBuffer(1,false,false),UUID.randomUUID().toString())
+	def apply[T](n:Int) = new Chan[T](new NormalBuffer(n,false,false),UUID.randomUUID.toString())
+	def timeout[T](d : Duration, v : T, name : String) : Chan[T] = {
+		val c = Chan[T](name)
+		Timeout.timeout(d) flatMap {_ => c.write(v)}
 		c
 	}
+  def timeout[T](d: Duration, v:T) : Chan[T] = timeout[T](d,v,UUID.randomUUID.toString())
 	def timeout(d : Duration) : Chan[Unit] = timeout(d,Unit)
   type CTuple = (Chan[T],T) forSome {type T}
-	def alts(cs : Chan[Any]*) : Future[CTuple] =  {
-			val p = Promise[(Chan[Any],Any)]
+  
+  object Blort {
+    def apply[T](c : (Chan[T],T)) = c
+    def unapply[T](c : (Chan[T],Any)) : Option[(Chan[T],T)] = Some((c._1,c._1.cast(c._2))) 
+    
+  }
+  
+  
+	def alts(cs : Chan[Any]*) : Future[CV[Any]] =  {
+			val p = Promise[CV[Any]]
 			cs.foreach { c => c.read(p) }
 			p.future
 	}
@@ -189,10 +215,7 @@ object Chan {
 
 
 }
-
-
-
-
+  
 
 object AsyncTest extends App {
 
@@ -202,7 +225,7 @@ object AsyncTest extends App {
 			val cRespond = Chan[Int]
 
 
-					async {
+	async {
 		while(true) {
 			println("Waiting")
 			val i = await(cListen.read)
@@ -220,17 +243,31 @@ object AsyncTest extends App {
 	}
 
 
+  
 
 
-	{
-		val c1 = Chan.timeout(1 second, 4)
-				val c2 = Chan.timeout(1 second, "four")
+  
 
-
+  {
+    
+    
+    
+    val c1 = Chan.timeout(1 second, 4, "An integer")
+	  val c2 = Chan.timeout(1 second, "four","A string")
+    
+    
+    /*
+     *  ccase (c,x) => body
+     * 
+     *  case (`c`,x123) => {val x = c.cast(x123)
+     *                      body }
+     * 
+     */
+    
  	async{
       await(Chan.alts(c1,c2)) match {
-			case (`c1`,i:Int) => println(s"${i+1}")
-			case (`c2`,s:String) => println(s)
+        case c1(i) => println(s"${i+1}")
+  			case c2(s) => println(s*3)
 			}
 		}    
 
@@ -239,4 +276,7 @@ object AsyncTest extends App {
 
 	Await.ready(Promise[Unit].future,Duration.Inf)
 
-}
+
+
+
+  }
