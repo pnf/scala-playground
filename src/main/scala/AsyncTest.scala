@@ -26,49 +26,104 @@ package core_async {
       f
     }
   }
+  
+  
 
-  // to be used in conjunction with alts in lieu of pReadyForXXX.future
-  class CancellablePromise[T](val p: Promise[T]) extends Promise[T] {
-    val h: scala.collection.mutable.HashMap[Promise[Any], T => Unit] = new scala.collection.mutable.HashMap()
 
+  object OfferResult extends Enumeration {
+    type OfferResult = Value
+    val AlreadyCompleted, DidComplete, DidNotComplete = Value
+  }
+  import OfferResult._
+  
+  /** Promise that might not be fulfilled.
+    */
+  class TentativePromise[T] {
+    val p = Promise[T]
     def future: scala.concurrent.Future[T] = p.future
-    def isCompleted: Boolean = p.isCompleted
-    def tryComplete(result: scala.util.Try[T]): Boolean = p.tryComplete(result)
+    /** Only evaluate the lazy offer if the promise is incomplete.
+     *  Only complete the promise if the offer returns Some
+     *  Returns tuple of (already completed, 
+     */
+    def tentativeOffer(o: => Option[T]) :  OfferResult = this.synchronized {
+      if(!p.isCompleted) o match {
+        case Some(t) => {p.success(t); DidComplete}
+        case None    => DidNotComplete
+      }
+      else AlreadyCompleted
+     }
+   }
+   object TentativePromise {
+    def apply[T] = new TentativePromise[T]
+   }
+  
 
-    def future(pCancel: Promise[Any])(body: T => Unit) = this.synchronized {
-      pCancel.future.andThen { case _ => h.synchronized { h -= pCancel } }
-      h += ((pCancel, body))
-    }
+  /** Promise that fulfills tentative promises.
+   */
+  class IndirectPromise[T,U]() extends Promise[U] {
+    type TP = TentativePromise[T]
+	  val p = Promise[U]
+		val h: scala.collection.mutable.HashMap[TP, TP => Unit] = new scala.collection.mutable.HashMap()
+
+    def future  = p.future
+    def isCompleted: Boolean = p.isCompleted
     
-    // Runs all bodies whose pCancel promises have not been completed.  In general, pCancel will
-    // be the pNotify of an alts call, and the underlying promise is one of the pReadyForXXXX 
-    p.future.map { x =>
-      this.synchronized {
-        h.foreach {
-          (pf: (Promise[Any], T => Unit)) =>
-            if (!pf._1.isCompleted) { pf._2(x) }
-        }
+    def tryComplete(result: scala.util.Try[U]): Boolean = this.synchronized {
+       if(p.tryComplete(result)) {  // fires any standard listeners
+          h.foreach {case (pDeliver,f) => f(pDeliver) }
+          true
+       } else false}
+
+    /** 
+     * When this IndirectPromise is complete, attempt to complete
+     * the TentativePromise pDeliver by passing it to f.
+     */
+    def futureOffer(pDeliver : TP)(f:TP=>Unit) : Unit = this.synchronized {
+      if(p.isCompleted) {
+        f(pDeliver)
+      } else {
+        h += ((pDeliver, f))
+        pDeliver.future.map {_ => this.synchronized{h -= pDeliver}}
       }
     }
+
+
   }
 
-  object CancellablePromise {
-    def apply[T] = new CancellablePromise[T](Promise[T]())
-    def successful[T](result: T): Promise[T] = new CancellablePromise(Promise.fromTry(Success(result)))
+  object IndirectPromise {
+    def apply[T,U] = new IndirectPromise[T,U]()
+    def successful[T,U](u:U) : IndirectPromise[T,U] = {
+      val p = new IndirectPromise[T,U]()
+      p.trySuccess(u)
+      p
+    }
   }
-
+  
+  case class BufferResult[T](v : T,
+        noLongerEmpty:Boolean=false,
+        noLongerFull:Boolean=false,
+        nowEmpty:Boolean=false,
+        nowFull:Boolean=false)
+  
+  
   // The only thing exciting about a ChanBuffer is that you pass its put/take methods
   // a promise to fulfill should that operation render the buffer no longer empty/full.
   abstract class ChanBuffer[T]() {
-    def put(v: T, onNoLongerEmpty: () => Unit, onFull: () => Unit): Option[Unit]
-    def take(onNoLongerFull: () => Unit, onEmpty: () => Unit): Option[T]
+    def put(v: T) : Option[BufferResult[T]]
+    def take : Option[BufferResult[T]]
   }
+  
+
 
   class NormalBuffer[T](n: Int, dropping: Boolean, sliding: Boolean) extends ChanBuffer[T] {
     val b = scala.collection.mutable.Buffer.empty[T]
-    def put(v: T, onNoLongerEmpty: () => Unit, onFull: () => Unit) = this.synchronized {
+    
+    override def toString = s"NormalBuffer($n, $dropping, $sliding, $b"
+    
+    def put(v:T) : Option[BufferResult[T]] = this.synchronized {
       val s = b.size
-      var ret: Option[Unit] = Some(Unit)
+      var noLongerEmpty = false
+      var nowFull = false
       if (s == n) {
         if (dropping) {
           b.update(n - 1, v)
@@ -76,42 +131,45 @@ package core_async {
           b.remove(0)
           b += v
         } else {
-          ret = None
+          return None
         }
-      } else if (s == (n - 1)) {
+      }
+      else if (s == (n - 1)) {
         b += v
-        onFull()
+        nowFull = true
         if (s == 0) {
-          onNoLongerEmpty()
+          noLongerEmpty = true
         }
       } else if (s == 0) {
         b += v
-        onNoLongerEmpty()
+        noLongerEmpty=true
       }
-      ret
+      Some(BufferResult(v,noLongerEmpty=noLongerEmpty,nowFull=nowFull))
     }
 
-    def take(onNoLongerFull: () => Unit, onEmpty: () => Unit) = this.synchronized {
+    def take : Option[BufferResult[T]]= this.synchronized {
       val s = b.size
+      var noLongerFull = false
+      var nowEmpty = false
       if (s > 0) {
         if (s == n) {
-          onNoLongerFull()
-          if (s == 1) { onEmpty() }
+          noLongerFull = true
+          if (s == 1) { nowEmpty=true}
         }
-        Some(b.remove(0))
+        Some(BufferResult(b.remove(0),nowEmpty=nowEmpty,noLongerFull=noLongerFull))
       } else {
         None
       }
     }
   }
   
-  case class CV[T](val c: Chan[T], val v: T)
+
   
   sealed trait ChanHolder[T] {
     def chan : Chan[T]
   }
   
-  class ChanValueHolder[T](val c:Chan[T], val v:T) extends ChanHolder[T] {
+  case class CV[T](val c: Chan[T], val v: T) extends ChanHolder[T] {
     def chan = c
   }
 
@@ -119,77 +177,81 @@ package core_async {
     
     def chan = this
 
-    private [this] var pReadyForWrite = CancellablePromise[Unit].success(Unit)
-    private [this ] var pReadyForRead = CancellablePromise[Unit]
+    private [this] var pReadyForWrite =   IndirectPromise.successful[CV[T],Unit](Unit)
+    private [this ] var pReadyForRead =   IndirectPromise[CV[T],Unit]
+    
 
+
+    override def toString = s"Chan($b,$name) rfw=${pReadyForWrite.isCompleted} rfr=${pReadyForRead.isCompleted}"
+    
     // Extract the value in a chan-value pair, properly cast.  Note we explicitly match
     // CV[Any], because Chan is invariant.
-    def unapply(cv: CV[Any]): Option[T] =
-      if (cv.c == this) {
+    def unapply(cv: CV[Chan.Pretender]): Option[T] =
+      if (cv.c eq this) {
         Some(cv.v.asInstanceOf[T])
       } else None
 
-    /** Attempt to write @v to the channel, fulfilling @pNotify if successful.
-     *  If not, reschedule an attempt when pReadyForWrite fires.
-     *  Do nothing if @pNotify is already completed.  
-     */
-    private[this] def tryWrite(v: T, pNotify: Promise[CV[T]]): Unit =
-      this.synchronized {
-        pNotify.synchronized {
-          if (!pNotify.isCompleted) {
-            b.put(v,
-                  () => pReadyForRead.trySuccess(Unit),
-                  () => pReadyForWrite = CancellablePromise[Unit] )
-              match {
-                case Some(_) => pNotify.trySuccess(CV(this,v))
-                case None    => pReadyForWrite.future.onSuccess { case _ => tryWrite(v, pNotify) }
-              }
-          }
-        }
-      }
 
-    /** Attempt to read for channel, fulfilling @pNotify with the tuple of the
-     *  channel and value read if successful.
-     *  If not, reschedule an attempt when pReadyForRead fires.
-     *  Do nothing if @pNotify is already completed.
-     */
-    private[this] def tryRead(pNotify: Promise[CV[T]]): Unit =
-      this.synchronized {
-        pNotify.synchronized {
-          if (!pNotify.isCompleted) {
-            b.take(() => pReadyForWrite.trySuccess(Unit),
-                   () => pReadyForRead = CancellablePromise[Unit])
-              match {
-                case Some(v) =>  pNotify.trySuccess(CV(this, v))
-                case None =>     pReadyForRead.future.onSuccess { case _ => tryRead(pNotify) }
-              }
-          }
-        }
+    // Only reschedule if we failed to write to the buffer, not if the promise was already completed.
+    private[this] def tryWrite(v: T, pNotify: TentativePromise[CV[T]]) : Unit = this.synchronized {
+      println(s"tryWrite $this $v $pNotify")
+      var trigger = false
+      pNotify.tentativeOffer(b.put(v).map { br => 
+         if (br.noLongerEmpty) {println(s"${this} nle $v"); trigger = true}
+         if (br.nowFull)       {println(s"${this} nf $v");  pReadyForWrite = IndirectPromise[CV[T],Unit]}
+         CV(this,v)
+      }) match {
+        case DidNotComplete => {println(s"${this} wdnc $v"); pReadyForWrite.futureOffer(pNotify){tryWrite(v,_)}}
+        case DidComplete => {println(s"${this} wdc $v")}
+        case AlreadyCompleted => {println(s"${this} ac $v")}
       }
+      if(trigger) pReadyForRead.trySuccess(Unit)
+    }
+
+
+      private[this] def tryRead(pNotify: TentativePromise[CV[T]]): Unit = this.synchronized {
+        println(s"tryRead $this $pNotify")
+        var trigger = false
+        pNotify.tentativeOffer(b.take.map {br =>
+          if(br.noLongerFull) {println(s"${this} nlf ${br.v}"); trigger = true}
+          if(br.nowEmpty)     {println(s"${this} ne ${br.v}");  pReadyForRead = IndirectPromise[CV[T],Unit]}
+          CV(this,br.v)
+        }) match {
+          case DidNotComplete => {println(s"${this} dnc");pReadyForRead.future map {_ => tryRead(pNotify)}}
+          case DidComplete           => println(s"${this} rdc");
+          case AlreadyCompleted      => println(s"${this} rac");
+        }
+        if(trigger) pReadyForWrite.trySuccess(Unit)
+      }
+    
+    
+
 
     /** Return a future that completes on successful write to the channel. 
      */
-    def write(v: T): Future[Unit] = {
-      val p = Promise[CV[T]]
-      pReadyForWrite.future.onSuccess { case _ => tryWrite(v, p) }
+    def write(v: T): Future[Unit] = this.synchronized {
+      val p = TentativePromise[CV[T]]
+      println(s"$this write $v $p")
+      pReadyForWrite.futureOffer(p)(tryWrite(v,_))
       p.future.map(_ => Unit)
     }
 
-    def read: Future[T] = {
-      val p = Promise[CV[T]]
-      pReadyForRead.future.onSuccess { case _ => tryRead(p) }
+    def read: Future[T] = this.synchronized {
+      val p = TentativePromise[CV[T]]
+      println(s"$this read $p")
+      pReadyForRead.futureOffer(p)(tryRead(_))
       p.future.map(_.v)
     }
 
-    /** When pReadyForRead fires, attempt to fulfill pNotify with CV tuple.
-        If pNotify fires first, de-register this callback.
-    */
-    def read(pNotify: Promise[CV[T]]): Unit =
-      pReadyForRead.future(pNotify.asInstanceOf[Promise[Any]]) { _ => tryRead(pNotify) }
+    
+    def read(pNotify: TentativePromise[CV[T]]): Unit = this.synchronized {
+      println(s"$this read $pNotify")
+     pReadyForRead.futureOffer(pNotify)(tryRead(_))}
 
-    def write(v: T, pNotify: Promise[CV[T]] ) : Unit =
-      pReadyForWrite.future(pNotify.asInstanceOf[Promise[Any]]) {_ => tryWrite(v, pNotify)}
-
+    def write(v: T, pNotify: TentativePromise[CV[T]] ) : Unit = this.synchronized {
+      println(s"$this write $pNotify")
+      pReadyForWrite.futureOffer(pNotify)(tryWrite(v,_))}
+      
   }
 
   
@@ -201,25 +263,28 @@ package core_async {
     def apply[T](n: Int) = new Chan[T](new NormalBuffer(n, false, false), UUID.randomUUID.toString())
     def timeout[T](d: Duration, v: T, name: String): Chan[T] = {
       val c = Chan[T](name)
-      Timeout.timeout(d) flatMap { _ => c.write(v) }
+      println(s"Creating timeout channel ${d}")
+      Timeout.timeout(d) flatMap {println("Timeout fired"); _ => c.write(v) }
       c
     }
     def timeout[T](d: Duration, v: T): Chan[T] = timeout[T](d, v, UUID.randomUUID.toString())
     def timeout(d: Duration): Chan[Unit] = timeout(d, Unit)
-    type CTuple = (Chan[T], T) forSome { type T }
+    
+    type Pretender
 
-
-    def alts(cs: ChanHolder[Any]*): Future[CV[Any]] = {
-      val p = Promise[CV[Any]]
+    def alts(cs: ChanHolder[Pretender]*): Future[CV[Pretender]] = {
+      val p = TentativePromise[CV[Pretender]]
       cs.foreach { _ match {
-        case c  : Chan[Any] => c.chan.read(p)
-        case cv : ChanValueHolder[Any] => cv.chan.write(cv.v,p)
+        case c  : Chan[Pretender] => c.chan.read(p)
+        case CV(c,v) => c.chan.write(v,p)
       }}
 
       p.future
     }
 
-    implicit def ghastly[T](c: Chan[T]): Chan[Any] = c.asInstanceOf[Chan[Any]]
+    implicit def ghastly[T](c: Chan[T]): Chan[Pretender] = c.asInstanceOf[Chan[Pretender]]
+    implicit def ghastly2[T](p : Promise[CV[T]]) = p.asInstanceOf[Promise[Unit]]
+
 
   }
 }
@@ -229,6 +294,17 @@ import core_async._
 object AsyncTest extends App {
 
   import Chan._
+  import scala.util.Random
+  
+
+  val f = Future {Thread.sleep(100);2}
+  val f2 = f.map {_+1}
+  val f3 = Future {Thread.sleep(1000); 3.14}
+  val f4 = async {await(f3).round == await(f2)}
+  async {
+    println(s"Flort ${await(f4)}")
+  }
+  
 
   val cListen = Chan[Int]
   val cRespond = Chan[Int]
@@ -251,19 +327,47 @@ object AsyncTest extends App {
   }
 
   {
+    
+    val c1 = Chan[Int]
+    val c2 = Chan[String]
+  
+  async {
+      while(true) {
+        val i = Random.nextInt(10)
+        println(s"Sending $i") 
+        await{c1.write(i)}
+        println(s"Sent $i") 
+        await{timeout((Random.nextInt(1000)) milliseconds).read}
+        println("About to send another integer")
+      }
+  }
 
-    val c1 = Chan.timeout(1 second, 4, "An integer")
-    val c2 = Chan.timeout(1 second, "four", "A string")
+  async {
+      while(true) {
+        val s = s"I am a string: ${Random.nextInt(10)}"
+        println(s"Sending $s")
+        await{c2.write(s)}
+        println(s"Sent $s")
+        await{timeout((Random.nextInt(1000)) milliseconds).read}
+        println("About to send another string")
+      }
+  }
 
-
+    var n = 100
     async {
-      await(Chan.alts(c1, c2)) match {
-        case c1(i) => println(s"${i + 1}")
-        case c2(s) => println(s + " flushing")
+      while(n>0) {
+        n=n-1
+        println("Running alts")
+        await(Chan.alts(c1, c2)) match {
+          case c1(i) => println(s"Plus one is ${i + 1}")
+          case c2(s) => println(s + " flushing")
+        }
       }
     }
 
   }
+  
+  
 
   Await.ready(Promise[Unit].future, Duration.Inf)
 
